@@ -151,7 +151,6 @@ class LlamaAttention(nn.Module):
         self.split_qk_v = cache_config.split_qk_v
 
         if self.split_qk_v:
-            print("Using split qk_v")
             self.q_proj = ColumnParallelLinear(input_size=self.hidden_size,
                                                output_size=self.hidden_size,
                                                bias=bias,
