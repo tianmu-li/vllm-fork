@@ -37,6 +37,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
                                                QKVParallelLinear,
+                                               ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -149,16 +150,43 @@ class LlamaAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.split_qk_v = cache_config.split_qk_v
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-            split_qk_v=self.split_qk_v,
-        )
+        if self.split_qk_v:
+            print("Using split qk_v")
+            self.q_proj = ColumnParallelLinear(input_size=self.hidden_size,
+                                               output_size=self.hidden_size,
+                                               bias=bias,
+                                               gather_output=False,
+                                               skip_bias_add=False,
+                                               params_dtype=None,
+                                               quant_config=quant_config,
+                                               prefix=f"{prefix}.q_proj")
+            self.k_proj = ColumnParallelLinear(input_size=self.hidden_size,
+                                               output_size=self.kv_size * tp_size,
+                                               bias=bias,
+                                               gather_output=False,
+                                               skip_bias_add=False,
+                                               params_dtype=None,
+                                               quant_config=quant_config,
+                                               prefix=f"{prefix}.k_proj")
+            self.v_proj = ColumnParallelLinear(input_size=self.hidden_size,
+                                               output_size=self.kv_size * tp_size,
+                                               bias=bias,
+                                               gather_output=False,
+                                               skip_bias_add=False,
+                                               params_dtype=None,
+                                               quant_config=quant_config,
+                                               prefix=f"{prefix}.v_proj")
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+                split_qk_v=self.split_qk_v,
+            )
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -215,7 +243,10 @@ class LlamaAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         if self.split_qk_v:
-            q, k, v, _ = self.qkv_proj(hidden_states)
+            # q, k, v, _ = self.qkv_proj(hidden_states)
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
@@ -512,14 +543,15 @@ class LlamaModel(nn.Module):
                                                    torch.Tensor]]) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
         if self.split_qk_v:
-            stacked_params_mapping.append((".qkv_proj.v_proj", ".v_proj", "v"))
-            stacked_params_mapping.append((".qkv_proj.k_proj", ".k_proj", "k"))
+            pass
+            # stacked_params_mapping.append((".qkv_proj.v_proj", ".v_proj", "v"))
+            # stacked_params_mapping.append((".qkv_proj.k_proj", ".k_proj", "k"))
         else:
+            stacked_params_mapping.append((".qkv_proj", ".q_proj", "q"))
             stacked_params_mapping.append((".qkv_proj", ".v_proj", "v"))
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
