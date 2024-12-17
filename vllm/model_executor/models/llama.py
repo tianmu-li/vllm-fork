@@ -125,19 +125,23 @@ class LlamaAttention(nn.Module):
         layer_idx = extract_layer_index(prefix)
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
+        tp_size_internal = int(os.environ.get("TP_SIZE_INTERNAL", "4"))
+        tp_size_total = tp_size * tp_size_internal
+        self.tp_size_internal = tp_size_internal
+        self.tp_size = tp_size
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % tp_size_total == 0
+        self.num_heads = self.total_num_heads // tp_size_total
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= tp_size_total:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % tp_size_total == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert tp_size_total % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size_total)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
         self.head_dim = getattr(config, "head_dim",
                                 self.hidden_size // self.total_num_heads)
@@ -147,15 +151,28 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
+        self.qkv_proj_list = torch.nn.ModuleList(
+            [QKVParallelLinear(
+                hidden_size=hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.total_num_heads,
+                total_num_kv_heads=self.total_num_kv_heads,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj_list.{idx}",
+                local_rank_internal=idx,
+                world_size_internal=tp_size_internal,
+            ) for idx in range(self.tp_size_internal)]
         )
+        # self.qkv_proj = QKVParallelLinear(
+        #     hidden_size=hidden_size,
+        #     head_size=self.head_dim,
+        #     total_num_heads=self.total_num_heads,
+        #     total_num_kv_heads=self.total_num_kv_heads,
+        #     bias=bias,
+        #     quant_config=quant_config,
+        #     prefix=f"{prefix}.qkv_proj",
+        # )
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -192,10 +209,10 @@ class LlamaAttention(nn.Module):
             sliding_window = None
 
         self.attn = Attention(
-            self.num_heads,
+            self.num_heads*self.tp_size_internal,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.num_kv_heads*self.tp_size_internal,
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=sliding_window,
@@ -209,9 +226,19 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q_parallel = []
+        k_parallel = []
+        v_parallel = []
+        for qkv_proj in self.qkv_proj_list:
+            qkv, _ = qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
+            q_parallel.append(q)
+            k_parallel.append(k)
+            v_parallel.append(v)
+        q = torch.cat(q_parallel, dim=-1)
+        k = torch.cat(k_parallel, dim=-1)
+        v = torch.cat(v_parallel, dim=-1)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
@@ -431,9 +458,17 @@ class LlamaModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if param_name==".qkv_proj":
+                    tp_size_internal = int(os.environ.get("TP_SIZE_INTERNAL", "4"))
+                    for i in range(tp_size_internal):
+                        name_new = name.replace("qkv_proj", f"qkv_proj_list.{i}")
+                        param = params_dict[name_new]
+                        weight_loader = param.weight_loader
+                        weight_loader(param, loaded_weight, shard_id)
+                else:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.

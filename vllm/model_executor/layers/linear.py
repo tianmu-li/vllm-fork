@@ -283,7 +283,9 @@ class ColumnParallelLinear(LinearBase):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  output_sizes: Optional[List[int]] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 local_rank_internal: int=0,
+                 world_size_internal: int=1):
         super().__init__(input_size, output_size, skip_bias_add, params_dtype,
                          quant_config, prefix)
 
@@ -292,6 +294,14 @@ class ColumnParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size()
+        tp_size_internal = world_size_internal
+        tp_size_total = tp_size * tp_size_internal
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank_internal = local_rank_internal
+        tp_rank_total = tp_rank*tp_size_internal + tp_rank_internal
+        self.tp_size_total = tp_size_total
+        self.tp_rank_total = tp_rank_total
+        tp_size = self.tp_size_total
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -327,7 +337,8 @@ class ColumnParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
+        # tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = self.tp_rank_total
         output_dim = getattr(param, "output_dim", None)
 
         # Special case for GGUF
@@ -385,7 +396,7 @@ class ColumnParallelLinear(LinearBase):
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size_per_partition}"
         s += f", bias={self.bias is not None}"
-        s += f", tp_size={get_tensor_model_parallel_world_size()}"
+        s += f", tp_size={self.tp_size_total}"
         s += f", gather_output={self.gather_output}"
         return s
 
@@ -669,7 +680,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                  skip_bias_add: bool = False,
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 local_rank_internal: int = 0,
+                 world_size_internal: int = 1):
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.total_num_heads = total_num_heads
@@ -678,21 +691,28 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
         tp_size = get_tensor_model_parallel_world_size()
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
+        tp_size_internal = world_size_internal
+        tp_size_total = tp_size * tp_size_internal
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank_internal = local_rank_internal
+        tp_rank_total = tp_rank*tp_size_internal + tp_rank_internal
+        self.tp_size_total = tp_size_total
+        self.tp_rank_total = tp_rank_total
+        self.num_heads = divide(self.total_num_heads, tp_size_total)
+        if tp_size_total >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size,
+            self.num_kv_head_replicas = divide(tp_size_total,
                                                self.total_num_kv_heads)
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size_total)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
         output_size = (self.num_heads +
-                       2 * self.num_kv_heads) * tp_size * self.head_size
+                       2 * self.num_kv_heads) * tp_size_total * self.head_size
         self.output_sizes = [
-            self.num_heads * self.head_size * tp_size,  # q_proj
-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj 
+            self.num_heads * self.head_size * tp_size_total,  # q_proj
+            self.num_kv_heads * self.head_size * tp_size_total,  # k_proj
+            self.num_kv_heads * self.head_size * tp_size_total,  # v_proj 
         ]
 
         super().__init__(input_size=input_size,
@@ -702,7 +722,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
                          quant_config=quant_config,
-                         prefix=prefix)
+                         prefix=prefix,
+                         local_rank_internal=local_rank_internal,
+                         world_size_internal=world_size_internal)
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
@@ -798,9 +820,12 @@ class QKVParallelLinear(ColumnParallelLinear):
             param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
             return
 
+        tp_size = self.tp_size_total
+        tp_rank = self.tp_rank_total
+
         if is_gguf_weight:
-            tp_size = get_tensor_model_parallel_world_size()
-            tp_rank = get_tensor_model_parallel_rank()
+            # tp_size = get_tensor_model_parallel_world_size()
+            # tp_rank = get_tensor_model_parallel_rank()
 
             output_dim = getattr(param, "output_dim", None)
             shard_size = loaded_weight.size(output_dim) // tp_size
@@ -881,7 +906,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
 
-        tp_rank = get_tensor_model_parallel_rank()
+        # tp_rank = get_tensor_model_parallel_rank()
         assert loaded_shard_id in ["q", "k", "v"]
 
         # If output dim is defined, use the default loading process.
