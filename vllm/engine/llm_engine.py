@@ -249,22 +249,8 @@ class LLMEngine:
         )
 
         logger.info(
-            "Initializing an LLM engine (v%s) with config: "
-            "model=%r, speculative_config=%r, tokenizer=%r, "
-            "skip_tokenizer_init=%s, tokenizer_mode=%s, revision=%s, "
-            "override_neuron_config=%s, tokenizer_revision=%s, "
-            "trust_remote_code=%s, dtype=%s, max_seq_len=%d, "
-            "download_dir=%r, load_format=%s, tensor_parallel_size=%d, "
-            "pipeline_parallel_size=%d, "
-            "disable_custom_all_reduce=%s, quantization=%s, "
-            "weights_load_device=%s, enforce_eager=%s, kv_cache_dtype=%s, "
-            "quantization_param_path=%s, device_config=%s, "
-            "decoding_config=%r, observability_config=%r, "
-            "seed=%d, served_model_name=%s, "
-            "num_scheduler_steps=%d, chunked_prefill_enabled=%s "
-            "multi_step_stream_outputs=%s, enable_prefix_caching=%s, "
-            "use_async_output_proc=%s, use_cached_outputs=%s, "
-            "mm_processor_kwargs=%s, pooler_config=%r, split_qk_v=%s)",
+            "Initializing an LLM engine (v%s) with config: %r,"
+            "use_cached_outputs=%s, ",
             VLLM_VERSION,
             vllm_config,
             use_cached_outputs,
