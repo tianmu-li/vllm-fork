@@ -601,10 +601,6 @@ class LlamaModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                if self.split_qk_v and (shard_id == "v" or shard_id == "k" or shard_id == "q") :
-                    weight_loader(param, loaded_weight)
-                else:
-                    weight_loader(param, loaded_weight, shard_id)
 
                 break
             else:

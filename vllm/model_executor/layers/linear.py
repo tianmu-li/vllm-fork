@@ -686,14 +686,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
-        self.q_size = self.num_heads * self.head_size * tp_size
-        self.kv_size = self.num_kv_heads * self.head_size * tp_size
         input_size = self.hidden_size
-        self.output_sizes = [
-            self.q_size,  # q_proj
-        ]
         output_size = (self.num_heads +
-                        2 * self.num_kv_heads) * tp_size * self.head_size
+                       2 * self.num_kv_heads) * tp_size * self.head_size
         self.output_sizes = [
             self.num_heads * self.head_size * tp_size,  # q_proj
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
@@ -927,6 +922,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                     ((self.num_heads + 2 * self.num_kv_heads) * self.head_size,
                      0)
                 }
+                shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                    param, orig_qkv_offsets, loaded_shard_id)
 
             param_data = param_data.narrow(output_dim, shard_offset,
                                            shard_size)
@@ -963,6 +960,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+
 
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
