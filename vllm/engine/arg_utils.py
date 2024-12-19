@@ -124,6 +124,7 @@ class EngineArgs:
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
     split_qk_v: bool = False
+    split_gate_up: bool = False
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: int = 256
     max_num_prefill_seqs: Optional[int] = None
@@ -507,6 +508,10 @@ class EngineArgs:
                             action='store_true',
                             default=EngineArgs.split_qk_v,
                             help='Whether to separate qk and v calculations.')
+        parser.add_argument('--split-gate-up',
+                            action='store_true',
+                            default=EngineArgs.split_gate_up,
+                            help='Whether to separate gate and up calculations.')
         parser.add_argument('--max-num-batched-tokens',
                             type=int,
                             default=EngineArgs.max_num_batched_tokens,
@@ -1056,6 +1061,7 @@ class EngineArgs:
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,
             split_qk_v=self.split_qk_v,
+            split_gate_up=self.split_gate_up,
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,

@@ -73,10 +73,11 @@ class LlamaMLP(nn.Module):
         bias: bool = False,
         prefix: str = "",
         do_split: bool = False,
-        split_size: int = 2
+        split_size: int = 2,
+        split_gate_up: bool = False
     ) -> None:
         super().__init__()
-        self.split_gate_up = True
+        self.split_gate_up = split_gate_up
         if self.split_gate_up:
             self.gate_proj = ColumnParallelLinear(
                 input_size=hidden_size,
@@ -115,11 +116,11 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x, skip_seq_split=False):
-        # if self.split_gate_up:
-        x = nn.functional.silu(self.gate_proj(x)[0]) * self.up_proj(x)[0]
-        # else:
-        #     x, _ = self.gate_up_proj(x)
-        #     x = self.act_fn(x)
+        if self.split_gate_up:
+            x = nn.functional.silu(self.gate_proj(x)[0]) * self.up_proj(x)[0]
+        else:
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(x)
         self.down_proj.skip_seq_split=skip_seq_split
         x, _ = self.down_proj(x)
         return x
@@ -260,15 +261,15 @@ class LlamaAttention(nn.Module):
         skip_seq_split: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        # if self.split_qk_v:
-        # q, k, v, _ = self.qkv_proj(hidden_states)
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
-        # else:
-        #     qkv, _ = self.qkv_proj(hidden_states)
-        #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-        #                         dim=-1)
+        if self.split_qk_v:
+            # q, k, v, _ = self.qkv_proj(hidden_states)
+            q, _ = self.q_proj(hidden_states)
+            k, _ = self.k_proj(hidden_states)
+            v, _ = self.v_proj(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
+                                dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata, **kwargs)
         self.o_proj.skip_seq_split=skip_seq_split
@@ -330,7 +331,8 @@ class LlamaDecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
             do_split=do_split,
-            split_size=split_size
+            split_size=split_size,
+            split_gate_up=cache_config.split_gate_up
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -508,7 +510,7 @@ class LlamaModel(nn.Module):
                 ["hidden_states", "residual"], config.hidden_size))
 
         self.split_qk_v = cache_config.split_qk_v
-        self.split_gate_up = True
+        self.split_gate_up = cache_config.split_gate_up
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -599,7 +601,7 @@ class LlamaModel(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                if self.split_qk_v and (shard_id == "v" or shard_id == "k") :
+                if self.split_qk_v and (shard_id == "v" or shard_id == "k" or shard_id == "q") :
                     weight_loader(param, loaded_weight)
                 else:
                     weight_loader(param, loaded_weight, shard_id)

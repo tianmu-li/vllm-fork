@@ -692,10 +692,13 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.output_sizes = [
             self.q_size,  # q_proj
         ]
-
         output_size = (self.num_heads +
                         2 * self.num_kv_heads) * tp_size * self.head_size
-        self.output_sizes.append(self.kv_size)  # v_proj
+        self.output_sizes = [
+            self.num_heads * self.head_size * tp_size,  # q_proj
+            self.num_kv_heads * self.head_size * tp_size,  # k_proj
+            self.num_kv_heads * self.head_size * tp_size,  # v_proj 
+        ]
 
         super().__init__(input_size=input_size,
                          output_size=output_size,
@@ -915,19 +918,15 @@ class QKVParallelLinear(ColumnParallelLinear):
             if use_bitsandbytes_4bit:
                 orig_qkv_offsets = {
                     "q": (0, self.num_heads * self.head_size),
+                    "k": (self.num_heads * self.head_size,
+                          self.num_kv_heads * self.head_size),
+                    "v":
+                    ((self.num_heads + self.num_kv_heads) * self.head_size,
+                     self.num_kv_heads * self.head_size),
+                    "total":
+                    ((self.num_heads + 2 * self.num_kv_heads) * self.head_size,
+                     0)
                 }
-
-                orig_qkv_offsets["k"] = (
-                    (self.num_heads) * self.head_size,
-                    self.num_kv_heads * self.head_size)
-                orig_qkv_offsets["v"] = (
-                    (self.num_heads + self.num_kv_heads) * self.head_size,
-                    self.num_kv_heads * self.head_size)
-                orig_qkv_offsets["total"] = (
-                    (self.num_heads + 2 * self.num_kv_heads) *
-                    self.head_size, 0)
-                shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
-                    param, orig_qkv_offsets, loaded_shard_id)
 
             param_data = param_data.narrow(output_dim, shard_offset,
                                            shard_size)
