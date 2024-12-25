@@ -78,6 +78,7 @@ class LlamaMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.split_gate_up = split_gate_up
+        self.hidden_size = hidden_size
         if self.split_gate_up:
             self.gate_proj = ColumnParallelLinear(
                 input_size=hidden_size,
@@ -116,6 +117,10 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x, skip_seq_split=False):
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        if (seq_len*batch_size)%512==0:
+            x = x.view(-1,512,self.hidden_size)
         if self.split_gate_up:
             x = nn.functional.silu(self.gate_proj(x)[0]) * self.up_proj(x)[0]
         else:
@@ -123,6 +128,8 @@ class LlamaMLP(nn.Module):
             x = self.act_fn(x)
         self.down_proj.skip_seq_split=skip_seq_split
         x, _ = self.down_proj(x)
+        if (seq_len*batch_size)%512==0:
+            x = x.view(batch_size,seq_len,self.hidden_size)
         return x
 
 
