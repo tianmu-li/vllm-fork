@@ -61,6 +61,16 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
 
 is_hpu = current_platform.is_hpu()
 
+# split_size>128: fixed-length splits (each slice is split_size)
+# split_size<128: fixed-num splits (split_size num of slices)
+def get_split_size(seq_len, batch_size, orig_split_size):
+    if orig_split_size<128:
+        split_size = max((seq_len*batch_size)//orig_split_size, 1)
+    else:
+        split_size = orig_split_size
+    return split_size
+
+VLLM_MLP_SIZE_OVERRIDE = int(os.environ.get("VLLM_MLP_SIZE_OVERRIDE", "512"))
 
 class LlamaMLP(nn.Module):
 
@@ -108,8 +118,8 @@ class LlamaMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
-            do_split=do_split,
-            split_size=split_size
+            # do_split=do_split,
+            # split_size=split_size
         )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
@@ -126,8 +136,10 @@ class LlamaMLP(nn.Module):
         else:
             x, _ = self.gate_up_proj(x)
             x = self.act_fn(x)
-        self.down_proj.skip_seq_split=skip_seq_split
+
+        # Separate split for down is not implemented yet
         x, _ = self.down_proj(x)
+
         if (seq_len*batch_size)%512==0:
             x = x.view(batch_size,seq_len,self.hidden_size)
         return x
@@ -149,7 +161,8 @@ class LlamaAttention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         prefix: str = "",
         do_split: bool = False,
-        split_size: int = 2
+        split_size: int = 2,
+        output_slice: bool = False
     ) -> None:
         super().__init__()
         layer_idx = extract_layer_index(prefix)
@@ -177,6 +190,9 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.split_qk_v = cache_config.split_qk_v
+        self.do_split = do_split
+        self.split_size = split_size
+        self.output_slice = output_slice
 
         if self.split_qk_v:
             self.q_proj = ColumnParallelLinear(input_size=self.hidden_size,
@@ -220,8 +236,8 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
-            do_split=do_split,
-            split_size=split_size,
+            # do_split=do_split,
+            # split_size=split_size,
         )
 
         is_neox_style = True
@@ -268,6 +284,10 @@ class LlamaAttention(nn.Module):
         skip_seq_split: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        batch_size = hidden_states.size(0)
+        seq_len = hidden_states.size(1)
+        split_size = get_split_size(seq_len, batch_size, self.split_size)
+        do_split = self.do_split and attn_metadata.is_prompt
         if self.split_qk_v:
             # q, k, v, _ = self.qkv_proj(hidden_states)
             q, _ = self.q_proj(hidden_states)
@@ -279,9 +299,21 @@ class LlamaAttention(nn.Module):
                                 dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata, **kwargs)
-        self.o_proj.skip_seq_split=skip_seq_split
-        output, _ = self.o_proj(attn_output)
-        return output
+        if ((seq_len*batch_size)%split_size==0) and do_split:
+            attn_output = attn_output.view(-1, split_size, self.q_size)
+            attn_list = torch.split(attn_output, 1)
+            output_list = []
+            for attn_slice in attn_list:
+                output_list.append(self.o_proj(attn_slice)[0])
+            if self.output_slice:
+                return output_list
+            else:
+                output = torch.cat(output_list)
+                output = output.view(batch_size, seq_len, self.hidden_size)
+                return output
+        else:
+            output, _ = self.o_proj(attn_output)
+            return output
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -312,8 +344,12 @@ class LlamaDecoderLayer(nn.Module):
             config, "bias", False)
 
         split_size = int(os.environ.get('VLLM_TP_SPLIT_SIZE_BY_SEQ', '1'))
+        output_slice = int(os.environ.get('OUTPUT_SLICE', '1')) == 1
         enable_o_proj_split = int(os.environ.get('VLLM_TP_O_PROJ_SPLIT_ENABLE', '1')) == 1
         do_split = split_size > 1
+        self.split_size = split_size
+        self.do_split = do_split
+        self.output_slice = output_slice and do_split
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -329,6 +365,7 @@ class LlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             do_split=do_split and enable_o_proj_split,
             split_size=split_size,
+            output_slice=output_slice
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -339,7 +376,7 @@ class LlamaDecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
             do_split=do_split,
             split_size=split_size,
-            split_gate_up=cache_config.split_gate_up
+            split_gate_up=cache_config.split_gate_up,
         )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -374,15 +411,42 @@ class LlamaDecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(
                     hidden_states, residual)
+            hidden_states_shape = hidden_states.shape
+            batch_size, seq_len, hidden_size = hidden_states_shape
+
+            split_size = get_split_size(seq_len, batch_size, self.split_size)
+            # only split for prefill
+            do_split = self.do_split and attn_metadata.is_prompt
+            
             hidden_states = self.self_attn(positions=positions,
                                            hidden_states=hidden_states,
                                            kv_cache=kv_cache,
                                            attn_metadata=attn_metadata)
-
-            # Fully Connected
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual)
-            hidden_states = self.mlp(hidden_states)
+            
+            # self_attn output a list of tensors to be processed sequential at layernorm and mlp
+            if do_split and (seq_len*batch_size)%split_size==0 and self.output_slice:
+                # Slice residual
+                residual_shape = residual.shape
+                residual = residual.view(-1, split_size, hidden_size)
+                residual_list = torch.split(residual, 1)
+                residual_list_output = []
+                output_list = []
+                # Sequentially process slices
+                for hidden_state, residual in zip(hidden_states, residual_list):
+                    hidden_state, residual = self.post_attention_layernorm(hidden_state, residual)
+                    # hidden_state = self.mlp.forward_pre_down(hidden_state)
+                    hidden_state = self.mlp(hidden_state)
+                    residual_list_output.append(residual)
+                    output_list.append(hidden_state)
+                # Combine slices
+                residual = torch.cat(residual_list_output).view(*residual_shape)
+                hidden_states = torch.cat(output_list).view(batch_size, seq_len, -1)
+                # hidden_states = self.mlp.forward_down_proj(hidden_states)
+            else:
+                # Fully Connected
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
+                hidden_states = self.mlp(hidden_states)
         else:
             hidden_states, residual = self.try_split_forward(
                 positions, hidden_states, kv_cache, attn_metadata, residual)
@@ -447,13 +511,12 @@ class LlamaDecoderLayer(nn.Module):
                 block_indices=block_indices_list[i],
                 block_offsets=block_offsets_list[i],
                 seq_lens_tensor=seq_lens_tensor_list[i],
-                attn_bias=attn_bias_list[i],
-                skip_seq_split=True)
+                attn_bias=attn_bias_list[i])
         for i in range(split):
             res_hidden_states_list[i], res_residual_list[
                 i] = self.post_attention_layernorm(res_hidden_states_list[i],
                                                    res_residual_list[i])
-            res_hidden_states_list[i] = self.mlp(res_hidden_states_list[i], skip_seq_split=True)
+            res_hidden_states_list[i] = self.mlp(res_hidden_states_list[i])
 
         if self.layer_idx == (self.total_num_layers - 1):
             hidden_states = torch.cat(res_hidden_states_list, dim=0)
