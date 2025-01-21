@@ -299,12 +299,13 @@ class LlamaAttention(nn.Module):
                                 dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata, **kwargs)
-        if ((seq_len*batch_size)%split_size==0) and do_split:
-            attn_output = attn_output.view(-1, split_size, self.q_size)
-            attn_list = torch.split(attn_output, 1)
+        if ((seq_len*batch_size)//split_size>=2) and do_split:
+            attn_output = attn_output.view(1, -1, self.q_size)
+            attn_list = torch.split(attn_output, split_size, 1)
             output_list = []
             for attn_slice in attn_list:
-                output_list.append(self.o_proj(attn_slice)[0])
+                output_slice = self.o_proj(attn_slice)[0]
+                output_list.append(output_slice)
             if self.output_slice:
                 return output_list
             else:
@@ -424,11 +425,12 @@ class LlamaDecoderLayer(nn.Module):
                                            attn_metadata=attn_metadata)
             
             # self_attn output a list of tensors to be processed sequential at layernorm and mlp
-            if do_split and (seq_len*batch_size)%split_size==0 and self.output_slice:
+            if do_split and (seq_len*batch_size)//split_size>=2 and self.output_slice:
                 # Slice residual
                 residual_shape = residual.shape
-                residual = residual.view(-1, split_size, hidden_size)
-                residual_list = torch.split(residual, 1)
+                residual = residual.view(1, -1, hidden_size)
+                residual_list = torch.split(residual, split_size, 1)
+
                 residual_list_output = []
                 output_list = []
                 # Sequentially process slices
@@ -439,8 +441,8 @@ class LlamaDecoderLayer(nn.Module):
                     residual_list_output.append(residual)
                     output_list.append(hidden_state)
                 # Combine slices
-                residual = torch.cat(residual_list_output).view(*residual_shape)
-                hidden_states = torch.cat(output_list).view(batch_size, seq_len, -1)
+                residual = torch.cat(residual_list_output, dim=1).view(*residual_shape)
+                hidden_states = torch.cat(output_list, dim=1).view(batch_size, seq_len, -1)
                 # hidden_states = self.mlp.forward_down_proj(hidden_states)
             else:
                 # Fully Connected
