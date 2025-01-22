@@ -57,8 +57,9 @@ def prompt_fsdpa(
     return attn_weights
 
 const_norm = os.environ.get('VLLM_SOFTMAX_CONST_NORM', 'false').lower() == 'true'
-const_val = os.environ.get('VLLM_SOFTMAX_CONST_VAL', '10.0')
-def pa(attn, value, block_groups, block_mapping, batch2block_matmul_op, block2batch_matmul_op):
+const_val = float(os.environ.get('VLLM_SOFTMAX_CONST_VAL', '10.0'))
+eps_value = float(os.environ.get('VLLM_SOFTMAX_EPS_VALUE', str(torch.finfo(torch.bfloat16).tiny)))
+def pa(attn, value, block_groups, block_mapping, matmul_av_op, batch2block_matmul_op, block2batch_matmul_op):
     #normalization
     attn.sub_(const_val)
     # end of norm
@@ -68,10 +69,10 @@ def pa(attn, value, block_groups, block_mapping, batch2block_matmul_op, block2ba
     # Sum block's sums that belongs to the same sequeneces
     group_sums = ops.block2batch(sums, block_mapping, block2batch_matmul_op)
     group_sums = ops.batch2block(group_sums, block_mapping, batch2block_matmul_op)
-    group_sums.add_(torch.finfo(group_sums.dtype).tiny)
+    group_sums.add_(eps_value)
     group_sums = torch.maximum(block_sum, group_sums)
     attn.div_(group_sums)
-    attn = ops.matmul_av_op(attn, value)
+    attn = matmul_av_op(attn, value)
     return attn
 
 def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
@@ -101,7 +102,7 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
         htcore.mark_step()
     attn = attn + block_bias
     if const_norm:
-        attn = pa(attn, value, block_groups, block_mapping, batch2block_matmul_op, block2batch_matmul_op,)
+        attn = pa(attn, value, block_groups, block_mapping, matmul_av_op, batch2block_matmul_op, block2batch_matmul_op,)
     else:
         attn = ops.pipelined_pa(attn, value, block_groups, block_mapping, block_scales=block_scales,
                             batch_size=batch_size, matmul_av_op=matmul_av_op,
@@ -372,7 +373,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
             output = out.reshape(batch_size, seq_len, hidden_size)
         else:
             # Decoding run.
-            output = HPUPagedAttention.forward_decode(
+            output = flat_pa(
                 query=query,
                 key_cache=key_cache,
                 value_cache=value_cache,
