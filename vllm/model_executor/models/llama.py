@@ -303,7 +303,7 @@ class LlamaAttention(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata, **kwargs)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         batch_size = attn_output.size(0)
         seq_len = attn_output.size(1)
         split_size = get_split_size(seq_len, batch_size, self.split_size)
@@ -346,7 +346,7 @@ class LlamaAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
                                 dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata, **kwargs)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         if ((seq_len*batch_size)//split_size>=2) and do_split:
             attn_output = attn_output.view(1, -1, self.q_size)
             attn_list = torch.split(attn_output, split_size, 1)
