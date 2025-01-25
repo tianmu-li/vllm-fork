@@ -565,8 +565,8 @@ class LlamaDecoderLayer(nn.Module):
                 # Delayed all_reduce
                 # Only do two slices for down_proj
                 # Make the first slice slightly larger to reduce the size of the tail
-                if i==(num_slices*3+4)//5:
-                    output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[:(num_slices*3+4)//5], dim=1)))
+                if i==(num_slices*3)//5:
+                    output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[:(num_slices*3)//5], dim=1)))
                 
                 hidden_state = self.mlp(hidden_state, mark_step=True)
                 # if not ((i==(num_slices+1)//2-1) or (i==num_slices-1)):
@@ -576,15 +576,15 @@ class LlamaDecoderLayer(nn.Module):
                 output_list_partial.append(hidden_state)
 
                 if i==num_slices-1:
-                    output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[(num_slices*3+4)//5:], dim=1)))
+                    output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[(num_slices*3)//5:], dim=1)))
                     
                 residual_list_partial.append(residual)
                 # htorch.core.mark_step()
 
             # output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[(num_slices+1)//2:], dim=1)))
             
-            residual_list_output.append(torch.cat(residual_list_partial[:(num_slices*3+4)//5], dim=1))
-            residual_list_output.append(torch.cat(residual_list_partial[(num_slices*3+4)//5:], dim=1))
+            residual_list_output.append(torch.cat(residual_list_partial[:(num_slices*3)//5], dim=1))
+            residual_list_output.append(torch.cat(residual_list_partial[(num_slices*3)//5:], dim=1))
             # print("shapes", output_list[0].size(), output_list[1].size(), residual_list_output[0].size(), residual_list_output[1].size())
             residual = residual_list_output
             hidden_states = output_list
