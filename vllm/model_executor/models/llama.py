@@ -32,7 +32,7 @@ from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
+                              get_tensor_model_parallel_world_size, tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
@@ -66,9 +66,12 @@ if is_hpu:
 def get_split_size(seq_len, batch_size, orig_split_size):
     if orig_split_size<128:
         split_size = max((seq_len*batch_size)//orig_split_size, 1)
+        split_size_list = split_size
     else:
         split_size = orig_split_size
-    return split_size
+        # split_size_list = [split_size, seq_len*batch_size-2*split_size, split_size]
+        split_size_list = split_size
+    return split_size, split_size_list
 
 # Use the first override whenever possible
 VLLM_MLP_SIZE_OVERRIDE = int(os.environ.get("VLLM_MLP_SIZE_OVERRIDE", "512"))
@@ -92,6 +95,7 @@ class LlamaMLP(nn.Module):
         super().__init__()
         self.split_gate_up = split_gate_up
         self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size//get_tensor_model_parallel_world_size()
         if self.split_gate_up:
             self.gate_proj = ColumnParallelLinear(
                 input_size=hidden_size,
@@ -121,13 +125,15 @@ class LlamaMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            reduce_results=not do_split
+            # reduce_results=False
         )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward_gateup(self, x):
         batch_size = x.size(0)
         seq_len = x.size(1)
         if (seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE==0:
@@ -140,7 +146,48 @@ class LlamaMLP(nn.Module):
             x, _ = self.gate_up_proj(x)
             x = self.act_fn(x)
 
+        if ((seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE==0) or ((seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE_2==0):
+            x = x.view(batch_size,seq_len,self.intermediate_size)
+        return x
+
+    def forward_down(self, x):
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        if (seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE==0:
+            x = x.view(-1,VLLM_MLP_SIZE_OVERRIDE,self.intermediate_size)
+        elif (seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE_2==0:
+            x = x.view(-1,VLLM_MLP_SIZE_OVERRIDE_2,self.intermediate_size)
+
         # Separate split for down is not implemented yet
+        x, _ = self.down_proj(x)
+
+        if ((seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE==0) or ((seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE_2==0):
+            x = x.view(batch_size,seq_len,self.hidden_size)
+        return x
+
+    def forward(self, x, mark_step=False):
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        if (seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE==0:
+            x = x.view(-1,VLLM_MLP_SIZE_OVERRIDE,self.hidden_size)
+        elif (seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE_2==0:
+            x = x.view(-1,VLLM_MLP_SIZE_OVERRIDE_2,self.hidden_size)
+        if self.split_gate_up:
+            x_gate = self.gate_proj(x)[0]
+            x_up = self.up_proj(x)[0]
+            if mark_step:
+                htorch.core.mark_step()
+            x = nn.functional.silu(x_gate) * x_up
+            # x = nn.functional.silu(self.gate_proj(x)[0]) * self.up_proj(x)[0]
+        else:
+            x, _ = self.gate_up_proj(x)
+            if mark_step:
+                htorch.core.mark_step()
+            x = self.act_fn(x)
+
+        # Separate split for down is not implemented yet
+        # if mark_step:
+        #     htorch.core.mark_step()
         x, _ = self.down_proj(x)
 
         if ((seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE==0) or ((seq_len*batch_size)%VLLM_MLP_SIZE_OVERRIDE_2==0):
@@ -308,11 +355,11 @@ class LlamaAttention(nn.Module):
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         batch_size = attn_output.size(0)
         seq_len = attn_output.size(1)
-        split_size = get_split_size(seq_len, batch_size, self.split_size)
+        split_size, split_size_list = get_split_size(seq_len, batch_size, self.split_size)
         do_split = self.do_split and attn_metadata.is_prompt
         if ((seq_len*batch_size)//split_size>=2) and do_split:
             attn_output = attn_output.view(1, -1, self.q_size)
-            attn_list = torch.split(attn_output, split_size, 1)
+            attn_list = torch.split(attn_output, split_size_list, 1)
             output_list = []
             for attn_slice in attn_list:
                 output_slice = self.o_proj(attn_slice)[0]
@@ -336,7 +383,7 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size = hidden_states.size(0)
         seq_len = hidden_states.size(1)
-        split_size = get_split_size(seq_len, batch_size, self.split_size)
+        split_size, split_size_list = get_split_size(seq_len, batch_size, self.split_size)
         do_split = self.do_split and attn_metadata.is_prompt
         if self.split_qk_v:
             # q, k, v, _ = self.qkv_proj(hidden_states)
@@ -351,7 +398,7 @@ class LlamaAttention(nn.Module):
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         if ((seq_len*batch_size)//split_size>=2) and do_split:
             attn_output = attn_output.view(1, -1, self.q_size)
-            attn_list = torch.split(attn_output, split_size, 1)
+            attn_list = torch.split(attn_output, split_size_list, 1)
             output_list = []
             for attn_slice in attn_list:
                 output_slice = self.o_proj(attn_slice)[0]
@@ -496,7 +543,7 @@ class LlamaDecoderLayer(nn.Module):
         
         # Calculate real seq_len from product of inaccurate batch_size and seq_len
         seq_len = (batch_size_fake*seq_len_fake)//batch_size
-        split_size = get_split_size(seq_len, batch_size, self.split_size)
+        split_size, split_size_list = get_split_size(seq_len, batch_size, self.split_size)
         # only split for prefill
         do_split = self.do_split and attn_metadata.is_prompt
 
@@ -504,17 +551,38 @@ class LlamaDecoderLayer(nn.Module):
         if do_split and (seq_len*batch_size)//split_size>=2 and self.output_slice:
             # Slice residual
             residual = residual.view(1, -1, hidden_size)
-            residual_list = torch.split(residual, split_size, 1)
+            residual_list = torch.split(residual, split_size_list, 1)
 
             residual_list_output = []
             output_list = []
+            intermediate_list = []
             # Sequentially process slices
-            for hidden_state, residual in zip(hidden_states, residual_list):
+            residual_list_partial = []
+            output_list_partial = []
+            num_slices = len(hidden_states)
+            for i,(hidden_state, residual) in enumerate(zip(hidden_states, residual_list)):
                 hidden_state, residual = self.post_attention_layernorm(hidden_state, residual)
-                hidden_state = self.mlp(hidden_state)
-                residual_list_output.append(residual)
-                output_list.append(hidden_state)
+                # Delayed all_reduce
+                if i==(num_slices+1)//2:
+                    output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[:(num_slices+1)//2], dim=1)))
+                
+                hidden_state = self.mlp(hidden_state, mark_step=True)
+                # if not ((i==(num_slices+1)//2-1) or (i==num_slices-1)):
+                #     hidden_state = self.mlp(hidden_state, mark_step=True)
+                # else:
+                #     hidden_state = self.mlp(hidden_state)
+                output_list_partial.append(hidden_state)
 
+                if i==num_slices-1:
+                    output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[(num_slices+1)//2:], dim=1)))        
+
+                    
+                residual_list_partial.append(residual)
+                # htorch.core.mark_step()
+
+            # output_list.append(tensor_model_parallel_all_reduce(torch.cat(output_list_partial[(num_slices+1)//2:], dim=1)))
+            residual_list_output.append(torch.cat(residual_list_partial[:(num_slices+1)//2], dim=1))
+            residual_list_output.append(torch.cat(residual_list_partial[(num_slices+1)//2:], dim=1))
             residual = residual_list_output
             hidden_states = output_list
 
@@ -523,6 +591,9 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
             hidden_states = self.mlp(hidden_states)
+            if self.do_split:
+                # Side effect of TP parallel with separate split sizes. Down proj skips all_reduce 
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
 
         return hidden_states, residual
 
@@ -619,6 +690,8 @@ class LlamaModel(nn.Module):
                 "residual": residual
             })
 
+        # if get_tensor_model_parallel_rank()==0:
+        #     print("Final output pre norm", hidden_states)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
