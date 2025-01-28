@@ -1379,7 +1379,8 @@ class LLMEngine:
         if self.scheduler_config.is_multi_step:
             for seq_group in seq_group_metadata_list:
                 seq_group.finish_step()
-
+        #import pdb
+        #pdb.set_trace()
         if not self._has_remaining_steps(seq_group_metadata_list):
             # clear the cache if we have finished all the steps.
             if self.scheduler_config.is_multi_step:
@@ -1398,7 +1399,7 @@ class LLMEngine:
                               is_async=allow_async_output_proc,
                               is_last_step=True,
                               is_first_step_output=is_first_step_output)
-
+            print('outputs:', outputs)
             if outputs and allow_async_output_proc:
                 assert len(outputs) == 1, (
                     "Async postprocessor expects only a single output set")

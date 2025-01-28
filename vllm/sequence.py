@@ -836,6 +836,7 @@ class SequenceGroup:
         return self.seqs if self.first_seq.is_finished() else []
 
     def update_num_computed_tokens(self, num_new_computed_tokens: int):
+        print('update_num_computed_tokens')
         """Update number of tokens computed so far."""
         seq = self.first_seq
         if not seq.is_finished():

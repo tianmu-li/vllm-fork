@@ -75,6 +75,7 @@ _PAD_BLOCK_ID = 0
 
 LORA_WARMUP_RANK = 8
 
+VLLM_DELAYED_SAMPLING = os.environ.get('VLLM_DELAYED_SAMPLING', 'false').lower() == 'true'
 
 def subtuple(obj: object,
              typename: str,
@@ -746,8 +747,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             raise ValueError(
                 "Speculative decoding is not supported with "
                 "contiguous PA, please set VLLM_CONTIGUOUS_PA=false")
-        # For multi-step scheduling
+        # For multi-step scheduling and delayed sampling
         self.cached_step_outputs: List[torch.Tensor] = []
+        # For delayed sampling
+        self.cached_step_inputs: List[ModelInputForHPUWithSamplingMetadata] = []
 
     def _set_gc_threshold(self) -> None:
         # Read https://docs.python.org/3/library/gc.html#gc.set_threshold
@@ -1886,7 +1889,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             is_single_step = \
                 self.vllm_config.scheduler_config.num_scheduler_steps == 1
             if is_prompt or is_single_step:
-                self.execute_model(inputs, kv_caches, warmup_mode=True)
+                self.execute_model(inputs, kv_caches, warmup_mode=True, use_delayed_sampling=False)
             else:  # decode with multi-step
                 inputs = dataclasses.replace(inputs,
                                              is_first_multi_step=True,
@@ -1895,7 +1898,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                    kv_caches,
                                    warmup_mode=True,
                                    num_steps=2,
-                                   seqs=seqs)
+                                   seqs=seqs,
+                                   use_delayed_sampling=False)
                 inputs = dataclasses.replace(inputs,
                                              is_first_multi_step=False,
                                              is_last_step=True)
@@ -1903,7 +1907,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                    kv_caches,
                                    warmup_mode=True,
                                    num_steps=2,
-                                   seqs=seqs)
+                                   seqs=seqs,
+                                   use_delayed_sampling=False)
             torch.hpu.synchronize()
             if profiler:
                 profiler.step()
@@ -2407,7 +2412,23 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         warmup_mode=False,
         previous_hidden_states: Optional[torch.Tensor] = None,
         seqs=None,
+        use_delayed_sampling=VLLM_DELAYED_SAMPLING,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        print('execute_model',
+              use_delayed_sampling,
+              len(self.cached_step_inputs),
+              len(self.cached_step_outputs))
+        if use_delayed_sampling:
+            assert num_steps == 1, 'Delayed sampling is not compatible with MSS!'
+            assert len(self.cached_step_inputs) == len(self.cached_step_outputs), 'cached_step_outputs is out of sync with cached_step_inputs!'
+            if len(self.cached_step_outputs) > 0:
+                delayed_output = self._decode_sampler_outputs(self.cached_step_inputs.pop())
+                htorch.core.mark_step()
+                print('update delayed output')
+            else:
+                delayed_output = []
+                print('first step -> empty output')
+
         if not model_input.is_first_multi_step:
             if not model_input.is_last_step:
                 # not first or last multi-step
@@ -2474,7 +2495,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                                     f"graphs{'T' if use_graphs else 'F'}")
             else:
                 model_event_name = 'model_executable'
-            if num_steps > 1:
+            if num_steps > 1 or use_delayed_sampling:
                 # in case of multi-step scheduling
                 # we only want to pythonize in the last step
                 sampling_metadata.skip_sampler_cpu_output = True
@@ -2551,11 +2572,14 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         logits=logits,
                         sampling_metadata=sampling_metadata,
                     )
-                    if num_steps > 1:
+                    if num_steps > 1 or use_delayed_sampling:
                         output = output.sampled_token_ids
                         self.cached_step_outputs.append(
                             output.detach().clone())
+                        if use_delayed_sampling:
+                            self.cached_step_inputs.append(model_input)
                 htorch.core.mark_step()
+                print(i, num_steps - 1)
                 if i < num_steps - 1:
                     if i == 0:
                         if model_input.async_callback is not None:
@@ -2592,6 +2616,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                             else:
                                 broadcast_tensor_dict({'early_exit': True},
                                                       src=0)
+                                print('????')
                                 if num_steps == 1:
                                     return [output]
                                 else:
@@ -2649,6 +2674,9 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     if model_input.is_prompt:
                         output.prefill_hidden_states = hidden_states
                     output.hidden_states = hidden_states
+                if use_delayed_sampling:
+                    return delayed_output if type(delayed_output) is list else [delayed_output]
+
                 return [output] if self.is_driver_worker else []
             else:
                 return []
