@@ -982,6 +982,9 @@ class LLMEngine:
         if len(ctx.output_queue) == 0:
             return None
 
+        #print('process outputs:', ctx.output_queue)
+        print('process outputs')
+
         # Get pending async postprocessor
         if request_id:
             # When we process only one request, no pop is required
@@ -1195,6 +1198,7 @@ class LLMEngine:
         sequences. This is normally done inside output processor, but it is
         required if the worker is to perform async forward pass to next step.
         """
+        print('advance')
         for seq_group_metadata, sequence_group_outputs, scheduled_seq_group in \
             zip(seq_group_metadata_list, output, scheduled_seq_groups):
             seq_group = scheduled_seq_group.seq_group
@@ -1232,6 +1236,7 @@ class LLMEngine:
                     seq.append_token_id(sample.output_token, sample.logprobs)
 
     def step(self) -> List[Union[RequestOutput, PoolingRequestOutput]]:
+        print('step')
         """Performs one decoding iteration and returns newly generated results.
 
         .. figure:: https://i.imgur.com/sv2HssD.png
@@ -1392,6 +1397,8 @@ class LLMEngine:
             is_first_step_output: bool = False if not seq_group_metadata_list \
                 else seq_group_metadata_list[0].state.num_steps == 1
 
+            #print('appending', outputs)
+            print('appending')
             # Add results to the output_queue
             ctx.append_output(outputs=outputs,
                               seq_group_metadata_list=seq_group_metadata_list,
@@ -1399,7 +1406,6 @@ class LLMEngine:
                               is_async=allow_async_output_proc,
                               is_last_step=True,
                               is_first_step_output=is_first_step_output)
-            print('outputs:', outputs)
             if outputs and allow_async_output_proc:
                 assert len(outputs) == 1, (
                     "Async postprocessor expects only a single output set")

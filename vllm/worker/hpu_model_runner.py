@@ -751,6 +751,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.cached_step_outputs: List[torch.Tensor] = []
         # For delayed sampling
         self.cached_step_inputs: List[ModelInputForHPUWithSamplingMetadata] = []
+        self.prev_callback = None
 
     def _set_gc_threshold(self) -> None:
         # Read https://docs.python.org/3/library/gc.html#gc.set_threshold
@@ -2414,21 +2415,10 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         seqs=None,
         use_delayed_sampling=VLLM_DELAYED_SAMPLING,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
-        print('execute_model',
-              use_delayed_sampling,
-              len(self.cached_step_inputs),
-              len(self.cached_step_outputs))
-        if use_delayed_sampling:
-            assert num_steps == 1, 'Delayed sampling is not compatible with MSS!'
-            assert len(self.cached_step_inputs) == len(self.cached_step_outputs), 'cached_step_outputs is out of sync with cached_step_inputs!'
-            if len(self.cached_step_outputs) > 0:
-                delayed_output = self._decode_sampler_outputs(self.cached_step_inputs.pop())
-                htorch.core.mark_step()
-                print('update delayed output')
-            else:
-                delayed_output = []
-                print('first step -> empty output')
-
+        #print('execute_model',
+        #      use_delayed_sampling,
+        #      len(self.cached_step_inputs),
+        #      len(self.cached_step_outputs))
         if not model_input.is_first_multi_step:
             if not model_input.is_last_step:
                 # not first or last multi-step
@@ -2493,6 +2483,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                                     f"bs{batch_size}_"
                                     f"seq{seq_len}_"
                                     f"graphs{'T' if use_graphs else 'F'}")
+                print('EXECUTE:', model_event_name)
             else:
                 model_event_name = 'model_executable'
             if num_steps > 1 or use_delayed_sampling:
@@ -2560,8 +2551,23 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 if not self.is_driver_worker:
                     continue
 
+                if use_delayed_sampling:
+                    assert num_steps == 1, 'Delayed sampling is not compatible with MSS!'
+                    # if len(self.cached_step_inputs) > 0:
+                    #     prev_inputs = self.cached_step_inputs.pop(0)
+                    #     next_token_ids = self.cached_step_outputs.pop(0)
+                    #     next_token_ids = next_token_ids.cpu().tolist()
+                    # else:
+                    next_token_ids = [[-1]] * batch_size
+                    fake_output = self._delayed_sampler_outputs(next_token_ids, model_input)
+                    #htorch.core.mark_step()
+                    #sel._advance_prompt_samples(model_input)
+
                 if model_input.async_callback is not None:
                     model_input.async_callback()
+                #if self.prev_callback is not None:
+                #    self.prev_callback()
+                #    self.prev_callback = None
                 # Sample the next token.
                 with self.profiler.record_event(
                         'internal', ('sample_'
@@ -2572,14 +2578,12 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         logits=logits,
                         sampling_metadata=sampling_metadata,
                     )
-                    if num_steps > 1 or use_delayed_sampling:
+                    if use_delayed_sampling or num_steps > 1:
                         output = output.sampled_token_ids
                         self.cached_step_outputs.append(
                             output.detach().clone())
-                        if use_delayed_sampling:
-                            self.cached_step_inputs.append(model_input)
+                        self.prev_callback = model_input.async_callback
                 htorch.core.mark_step()
-                print(i, num_steps - 1)
                 if i < num_steps - 1:
                     if i == 0:
                         if model_input.async_callback is not None:
@@ -2616,7 +2620,6 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                             else:
                                 broadcast_tensor_dict({'early_exit': True},
                                                       src=0)
-                                print('????')
                                 if num_steps == 1:
                                     return [output]
                                 else:
@@ -2675,13 +2678,30 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         output.prefill_hidden_states = hidden_states
                     output.hidden_states = hidden_states
                 if use_delayed_sampling:
-                    return delayed_output if type(delayed_output) is list else [delayed_output]
+                    return [fake_output], lambda: self._decode_sampler_outputs(
+                        model_input)
 
                 return [output] if self.is_driver_worker else []
             else:
                 return []
 
         return output if type(output) is list else [output]
+
+    def _advance_prompt_samples(self, model_input):
+        if not model_input.is_prompt:
+            return
+        print('advancing prompt')
+        assert model_input.async_callback is not None
+        ctx = model_input.async_callback.keywords[  # type: ignore
+            "ctx"]
+        for sg in ctx.seq_group_metadata_list:
+            for i, sd in sg.seq_data.items():
+                sd.update_num_computed_tokens(sd.get_num_uncomputed_tokens())
+
+    def _delayed_sampler_outputs(self, next_token_ids, model_input):
+        sampler_output = self._make_decode_output(
+            next_token_ids, model_input.sampling_metadata.seq_groups)
+        return sampler_output
 
     def _decode_sampler_outputs(self, model_input):
         use_async_out_proc = model_input.async_callback is not None
@@ -2732,3 +2752,12 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             sampler_outputs.append(
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
+
+
+def patch_outputs(dummy_output, output, model_input):
+    print('***********************')
+    #new_token_ids = output.sampled_token_ids.cpu().tolist()
+    #dummy_output.sampled_token_ids = new_token_ids
+    dummy_output.sampled_token_ids = output.sampled_token_ids
+    print('***********************')
+    model_input.async_callback()
