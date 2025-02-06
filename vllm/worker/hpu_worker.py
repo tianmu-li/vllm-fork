@@ -220,32 +220,6 @@ class HPUWorker(LocalOrDistributedWorkerBase):
     def load_model(self):
         self.model_runner.load_model()
 
-    def patch_output(self, dummy_output, delayed_output, exec_model_req):
-        ctx = exec_model_req.async_callback.keywords["ctx"]
-        print('patching!')
-        if len(ctx.output_queue) == 0:
-            print('patching skipped!')
-            return
-        #for o, do in zip(dummy_output, delayed_output()):
-        #    o.outputs = do.outputs
-        delayed_output = delayed_output()
-        #print('dummy_output:', dummy_output)
-        #print('real_output:', delayed_output)
-        assert len(delayed_output) == 1
-        assert len(ctx.output_queue) == 1
-        for dummy_out, real_out, queued_out in zip(dummy_output[0], delayed_output[0].outputs, ctx.output_queue[0].seq_group_metadata_list):
-            dummy_out.samples = real_out.samples
-            #print('<<', dummy_out)
-            #print('>>', real_out)
-            #print('||', queued_out)
-            assert len(queued_out.seq_data) == 1
-            # TODO: foearch seq_data ?
-            queued_seq_data = list(queued_out.seq_data.values())[0]
-            #queued_out.seq_data[0].output_token_ids[-1] = real_out.samples[0].output_token
-            queued_seq_data.output_token_ids = queued_seq_data.output_token_ids[:-1] + (real_out.samples[0].output_token,)
-            #print(queued_out.seq_data[0].output_token_ids)
-        #exec_model_req.async_callback()
-
     def execute_model(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
@@ -306,14 +280,8 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
             return output
 
-        if VLLM_DELAYED_SAMPLING and len(self.delayed_outputs) > 0:
-            self.patch_output(*self.delayed_outputs.pop(0))
         output = LocalOrDistributedWorkerBase.execute_model(
             self, execute_model_req)
-        if len(output) == 2:
-            output, delayed_output = output
-            self.delayed_outputs.append((output, delayed_output, execute_model_req))
-        print('return')
         return output
 
     @torch.inference_mode()

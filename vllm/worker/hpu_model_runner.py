@@ -11,7 +11,6 @@ import itertools
 import math
 import os
 import time
-import copy
 from array import array
 from enum import IntEnum
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
@@ -749,9 +748,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 "contiguous PA, please set VLLM_CONTIGUOUS_PA=false")
         # For multi-step scheduling and delayed sampling
         self.cached_step_outputs: List[torch.Tensor] = []
-        # For delayed sampling
         self.cached_step_inputs: List[ModelInputForHPUWithSamplingMetadata] = []
-        self.prev_callback = None
+        self.delayed_token_ids = []
 
     def _set_gc_threshold(self) -> None:
         # Read https://docs.python.org/3/library/gc.html#gc.set_threshold
@@ -888,7 +886,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 for seq_group_metadata in seq_group_metadata_list)
             temperature = 0.0 if has_greedy_samples else 1.0
             dummy_seq_group_metadata = self.create_dummy_seq_group_metadata(
-                0, 0, is_prompt, temperature=temperature)
+                -1, 0, is_prompt, temperature=temperature)
             seq_group_metadata_list.extend(dummy_seq_group_metadata
                                            for _ in range(batch_size_padding))
         return seq_group_metadata_list, real_batch_size, batch_size_padded
@@ -2403,6 +2401,9 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
 
         return lora_mask, lora_logits_mask
 
+    def _get_seq_ids(self, model_input):
+        return ([sg.seq_ids[0] for sg in model_input.sampling_metadata.seq_groups])
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2415,10 +2416,22 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         seqs=None,
         use_delayed_sampling=VLLM_DELAYED_SAMPLING,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
-        #print('execute_model',
-        #      use_delayed_sampling,
-        #      len(self.cached_step_inputs),
-        #      len(self.cached_step_outputs))
+        assert not (use_delayed_sampling and num_steps != 1), 'Delayed sampling is not compatible with MSS!'
+        if use_delayed_sampling and not model_input.is_prompt:
+            num_cached = len(self.cached_step_outputs)
+            assert num_cached > 0
+            cur_seq_ids = self._get_seq_ids(model_input)
+            cur_seq_id_pos = {sid: idx for idx, sid in enumerate(cur_seq_ids)}
+            htorch.core.mark_step()
+            for i in range(num_cached):
+                prev_seq_ids = self._get_seq_ids(self.cached_step_inputs[i])
+                target_indices = [cur_seq_id_pos.get(psi, -1) for psi in prev_seq_ids]
+                target_indices = torch.tensor(target_indices,
+                                              device=model_input.input_tokens.device,
+                                              dtype=model_input.input_tokens.dtype)
+                model_input.input_tokens.index_put_((target_indices,), self.cached_step_outputs[i])
+                htorch.core.mark_step()
+
         if not model_input.is_first_multi_step:
             if not model_input.is_last_step:
                 # not first or last multi-step
@@ -2552,23 +2565,9 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     continue
 
                 if use_delayed_sampling:
-                    assert num_steps == 1, 'Delayed sampling is not compatible with MSS!'
-                    # if len(self.cached_step_inputs) > 0:
-                    #     prev_inputs = self.cached_step_inputs.pop(0)
-                    #     next_token_ids = self.cached_step_outputs.pop(0)
-                    #     next_token_ids = next_token_ids.cpu().tolist()
-                    # else:
                     next_token_ids = [[-1]] * batch_size
                     fake_output = self._delayed_sampler_outputs(next_token_ids, model_input)
-                    #htorch.core.mark_step()
-                    #sel._advance_prompt_samples(model_input)
 
-                if model_input.async_callback is not None:
-                    model_input.async_callback()
-                #if self.prev_callback is not None:
-                #    self.prev_callback()
-                #    self.prev_callback = None
-                # Sample the next token.
                 with self.profiler.record_event(
                         'internal', ('sample_'
                                      f'{"prompt" if is_prompt else "decode"}_'
@@ -2578,12 +2577,21 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         logits=logits,
                         sampling_metadata=sampling_metadata,
                     )
-                    if use_delayed_sampling or num_steps > 1:
+                    if use_delayed_sampling:
+                        self._patch_prev_output()
+                    if num_steps > 1 or use_delayed_sampling:
                         output = output.sampled_token_ids
-                        self.cached_step_outputs.append(
-                            output.detach().clone())
-                        self.prev_callback = model_input.async_callback
+                        self.cached_step_outputs.append(output)
+                    if use_delayed_sampling:
+                        #output = output.sampled_token_ids
+                        #for i, sid in enumerate(seq_ids):
+                        #    self.delayed_token_ids[sid] = output[i].unsqueeze(-1).clone().detach()
+                        #self.delayed_token_ids.append((output, seq_ids))
+                        self.cached_step_inputs.append(
+                            model_input)
                 htorch.core.mark_step()
+                if model_input.async_callback is not None:
+                    model_input.async_callback()
                 if i < num_steps - 1:
                     if i == 0:
                         if model_input.async_callback is not None:
@@ -2678,8 +2686,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         output.prefill_hidden_states = hidden_states
                     output.hidden_states = hidden_states
                 if use_delayed_sampling:
-                    return [fake_output], lambda: self._decode_sampler_outputs(
-                        model_input)
+                    return [fake_output]
 
                 return [output] if self.is_driver_worker else []
             else:
@@ -2753,11 +2760,45 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
 
-
-def patch_outputs(dummy_output, output, model_input):
-    print('***********************')
-    #new_token_ids = output.sampled_token_ids.cpu().tolist()
-    #dummy_output.sampled_token_ids = new_token_ids
-    dummy_output.sampled_token_ids = output.sampled_token_ids
-    print('***********************')
-    model_input.async_callback()
+    def _patch_prev_output(self):
+        assert len(self.cached_step_inputs) == len(self.cached_step_outputs), \
+            f'Inputs and outputs are out of sync! {len(self.cached_step_inputs)} vs {len(self.cached_step_outputs)}'
+        if len(self.cached_step_inputs) == 0:
+            return
+        model_input = self.cached_step_inputs.pop(0)
+        delayed_output = self.cached_step_outputs.pop(0).cpu().squeeze(-1).tolist()
+        ctx = model_input.async_callback.keywords["ctx"]
+        assert len(ctx.output_queue) == 1, 'There should be exactly 1 output waiting!'
+        output_data = ctx.output_queue[0]
+        #print('pre:', output_data)
+        #print()
+        assert len(output_data.outputs) == 1
+        for o, do in zip(output_data.outputs[0], delayed_output):
+            o.samples[0].output_token = do
+        for sg, do in zip(output_data.seq_group_metadata_list, delayed_output):
+            assert len(sg.seq_data) == 1
+            seq_data = list(sg.seq_data.values())[0]
+            #seq_data.output_token_ids = seq_data.output_token_ids[:-1] + (do,)
+            seq_data.output_token_ids_array[-1] = do
+            seq_data._cached_all_token_ids[-1] = do
+        #print('post:', output_data)
+        #print()
+        ##for o, do in zip(dummy_output, delayed_output()):
+        ##    o.outputs = do.outputs
+        #delayed_output = delayed_output()
+        ##print('dummy_output:', dummy_output)
+        ##print('real_output:', delayed_output)
+        #assert len(delayed_output) == 1
+        #assert len(ctx.output_queue) == 1
+        #for dummy_out, real_out, queued_out in zip(dummy_output[0], delayed_output[0].outputs, ctx.output_queue[0].seq_group_metadata_list):
+        #    dummy_out.samples = real_out.samples
+        #    #print('<<', dummy_out)
+        #    #print('>>', real_out)
+        #    #print('||', queued_out)
+        #    assert len(queued_out.seq_data) == 1
+        #    # TODO: foearch seq_data ?
+        #    queued_seq_data = list(queued_out.seq_data.values())[0]
+        #    #queued_out.seq_data[0].output_token_ids[-1] = real_out.samples[0].output_token
+        #    queued_seq_data.output_token_ids = queued_seq_data.output_token_ids[:-1] + (real_out.samples[0].output_token,)
+        #    #print(queued_out.seq_data[0].output_token_ids)
+        ##exec_model_req.async_callback()
