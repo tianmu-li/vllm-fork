@@ -315,7 +315,6 @@ class SequenceData(msgspec.Struct,
     def update_num_computed_tokens(self, num_new_computed_tokens: int):
         """Update number of tokens computed so far."""
         self._num_computed_tokens += num_new_computed_tokens
-        #print(self._num_computed_tokens, len(self._prompt_token_ids), len(self._output_token_ids))
         assert self._num_computed_tokens <= self.get_len(), (
             self._num_computed_tokens, self.get_len())
         # If all tokens are computed, it means it is in decoding phase.

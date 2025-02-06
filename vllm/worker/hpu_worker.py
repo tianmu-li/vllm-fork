@@ -36,7 +36,6 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase, WorkerBase,
 
 logger = init_logger(__name__)
 
-VLLM_DELAYED_SAMPLING = os.environ.get('VLLM_DELAYED_SAMPLING', 'false').lower() == 'true'
 
 class HPUWorker(LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a HPU.
@@ -119,7 +118,6 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 on_trace_ready=fn(torch_profiler_trace_dir, use_gzip=True))
         else:
             self.profiler = None
-        self.delayed_outputs = []
 
     def full_trace_handler(self, dir_name, use_gzip=False):
 
