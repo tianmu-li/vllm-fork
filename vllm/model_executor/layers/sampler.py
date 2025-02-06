@@ -301,8 +301,8 @@ class Sampler(nn.Module):
 
         # Sample the next tokens.
         maybe_deferred_sample_results, maybe_sampled_tokens_tensor = _sample(
-            probs,
-            logprobs,
+            logits if self.force_greedy_sample else probs,
+            logits if self.force_greedy_sample else logprobs,
             sampling_metadata,
             sampling_tensors,
             include_gpu_probs_tensor=self.include_gpu_probs_tensor,
@@ -314,7 +314,7 @@ class Sampler(nn.Module):
             # preserve GPU-side tensors in support of later
             # deferred pythonization of logprobs
             assert maybe_sampled_tokens_tensor is not None
-            on_device_tensors = (logits if FORCE_GREEDY else probs, logits if FORCE_GREEDY else logprobs, maybe_sampled_tokens_tensor)
+            on_device_tensors = (logits if self.force_greedy_sample else probs, logits if self.force_greedy_sample else logprobs, maybe_sampled_tokens_tensor)
         else:
             # Since Pythonization has already happened, don't preserve
             # GPU-side tensors.
@@ -328,7 +328,7 @@ class Sampler(nn.Module):
             assert not isinstance(maybe_deferred_sample_results,
                                   SampleResultArgsType)
             prompt_logprobs, sample_logprobs = get_logprobs(
-                logits if FORCE_GREEDY else logprobs, sampling_metadata, maybe_deferred_sample_results)
+                logits if self.force_greedy_sample else logprobs, sampling_metadata, maybe_deferred_sample_results)
 
         return _build_sampler_output(
             maybe_deferred_sample_results,
