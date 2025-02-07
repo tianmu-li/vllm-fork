@@ -2423,7 +2423,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             num_cached = len(self.cached_step_outputs)
             assert num_cached > 0
             cur_seq_ids = self._get_seq_ids(model_input)
-            cur_seq_id_pos = {sid: idx for idx, sid in enumerate(cur_seq_ids)}
+            cur_seq_id_pos = {sid: idx for idx, sid in enumerate(cur_seq_ids) if sid >= 0}
             htorch.core.mark_step()
             for i in range(num_cached):
                 prev_seq_ids = self._get_seq_ids(self.cached_step_inputs[i])
@@ -2431,7 +2431,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 target_indices = torch.tensor(target_indices,
                                               device=model_input.input_tokens.device,
                                               dtype=model_input.input_tokens.dtype)
-                model_input.input_tokens.index_put_((target_indices,), self.cached_step_outputs[i])
+                model_input.input_tokens.index_copy_(0, target_indices, self.cached_step_outputs[i])
                 htorch.core.mark_step()
 
         if not model_input.is_first_multi_step:
@@ -2566,9 +2566,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     continue
 
                 if use_delayed_sampling:
-                    next_token_ids = [[DUMMY_TOKEN_ID]] * batch_size
-                    fake_output = self._delayed_sampler_outputs(next_token_ids,
-                                                                model_input)
+                    fake_output = self._delayed_sampler_outputs(model_input)
 
                 with self.profiler.record_event(
                         'internal', ('sample_'
@@ -2692,7 +2690,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
 
         return output if type(output) is list else [output]
 
-    def _delayed_sampler_outputs(self, next_token_ids, model_input):
+    def _delayed_sampler_outputs(self, model_input):
+        next_token_ids = [[DUMMY_TOKEN_ID]] * len(model_input.sampling_metadata.seq_groups)
         sampler_output = self._make_decode_output(
             next_token_ids, model_input.sampling_metadata.seq_groups)
         return sampler_output
