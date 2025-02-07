@@ -2405,6 +2405,16 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         return ([sg.seq_ids[0]
                  for sg in model_input.sampling_metadata.seq_groups])
 
+    def _pad_to_max_num_seqs(self, tensor, value):
+        padding_needed = self.max_num_seqs - tensor.size(0)
+        if padding_needed:
+            padding = torch.full((padding_needed, *tensor.shape[1:]),
+                                 value,
+                                 device=tensor.device,
+                                 dtype=tensor.dtype)
+            tensor = torch.cat([tensor, padding])
+        return tensor
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2428,6 +2438,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             for i in range(num_cached):
                 prev_seq_ids = self._get_seq_ids(self.cached_step_inputs[i])
                 target_indices = [cur_seq_id_pos.get(psi, -1) for psi in prev_seq_ids]
+                padding = self.cached_step_outputs[i].size(0) - len(target_indices)
+                target_indices.extend([-1] * padding)
                 target_indices = torch.tensor(target_indices,
                                               device=model_input.input_tokens.device,
                                               dtype=model_input.input_tokens.dtype)
@@ -2577,14 +2589,15 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         logits=logits,
                         sampling_metadata=sampling_metadata,
                     )
-                    if use_delayed_sampling:
-                        self._patch_prev_output()
-                    if num_steps > 1 or use_delayed_sampling:
+                    if num_steps > 1:
                         output = output.sampled_token_ids
                         self.cached_step_outputs.append(output)
                     if use_delayed_sampling:
-                        self.cached_step_inputs.append(
-                            model_input)
+                        self._patch_prev_output()
+                        output = self._pad_to_max_num_seqs(
+                            output.sampled_token_ids, DUMMY_TOKEN_ID)
+                        self.cached_step_outputs.append(output)
+                        self.cached_step_inputs.append(model_input)
                 htorch.core.mark_step()
                 if model_input.async_callback is not None:
                     model_input.async_callback()
@@ -2757,10 +2770,12 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         assert len(ctx.output_queue) == 1, 'There should be exactly 1 output waiting!'
         output_data = ctx.output_queue[0]
         assert len(output_data.outputs) == 1
-        for fake_out, delayed_out in zip(output_data.outputs[0], delayed_output):
-            fake_out.samples[0].output_token = delayed_out
-        for sg, delayed_out in zip(output_data.seq_group_metadata_list, delayed_output):
+        for fake_out, real_out in zip(output_data.outputs[0], delayed_output):
+            fake_out.samples[0].output_token = real_out
+        for sg, real_out in zip(output_data.seq_group_metadata_list, delayed_output):
             assert len(sg.seq_data) == 1
             seq_data = list(sg.seq_data.values())[0]
-            seq_data.output_token_ids_array[-1] = delayed_out
-            seq_data._cached_all_token_ids[-1] = delayed_out
+            # This is a hack. Assigning output_token_ids triggers
+            # a cache recomputation and we only need to update the last token
+            seq_data.output_token_ids_array[-1] = real_out
+            seq_data._cached_all_token_ids[-1] = real_out
