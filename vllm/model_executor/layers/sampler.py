@@ -189,8 +189,7 @@ class Sampler(nn.Module):
         # speculative decoding.
         self.include_gpu_probs_tensor = False
         self.should_modify_greedy_probs_inplace = False
-        self.force_greedy_sample = os.getenv('VLLM_FORCE_GREEDY_SAMPLE',
-                                   '0').lower() in ['1', 'true']
+        self.force_greedy_sample = FORCE_GREEDY
 
     def _init_sampling_tensors(
         self,
