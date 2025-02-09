@@ -2089,15 +2089,13 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     ("HabanaWorker.determine_num_available_blocks needs "
                     "to be called before warming up the model.")
                 free_mem = HabanaMemoryProfiler.current_free_device_memory()
-                graph_free_mem = free_mem - self.mem_margin
+                graph_free_mem = free_mem
                 graph_free_mem = align_workers(graph_free_mem,
                                                torch.distributed.ReduceOp.MIN)
                 prompt_graph_mem_ratio = float(
                     os.environ.get('VLLM_GRAPH_PROMPT_RATIO', '0.3'))
-                prompt_available_memory = (prompt_graph_mem_ratio *
-                                           graph_free_mem)
-                decode_available_memory = (graph_free_mem -
-                                           prompt_available_memory)
+                prompt_available_memory = graph_free_mem
+                decode_available_memory = graph_free_mem
                 msg = (
                     f"Using {format_bytes(graph_free_mem)}"
                     f"/{format_bytes(free_mem)} "
