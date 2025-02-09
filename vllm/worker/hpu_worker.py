@@ -314,7 +314,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         logger.info(msg)
         # At this point we should've allocated the maximum workspace for all
         # recipes we will use the extra memory for graphs/blocks
-        free_hpu_memory = torch.hpu.mem_get_info()[0]
+        free_hpu_memory = torch.hpu.mem_get_info()[0] * 2.0
 
         cache_block_size = self.get_cache_block_size_bytes()
         graph_reserved_mem = (float(
